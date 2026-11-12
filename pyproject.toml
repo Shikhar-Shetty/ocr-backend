@@ -1,0 +1,26 @@
+[project]
+name = "prestige-erp-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Shikhar Shetty", email = "shettyshikhar99@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "ilovepdf>=1.0.0",
+    "opencv-python-headless>=4.10.0",
+    "pillow>=11.0.0",
+    "pymupdf>=1.25.0",
+    "python-multipart>=0.0.20",
+    "python-dotenv>=1.0.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[project.scripts]
+prestige-erp-backend = "prestige_erp_backend:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
