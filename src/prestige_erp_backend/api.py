@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
@@ -14,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
+from ilovepdf.exceptions import AuthException, PathException, SignatureException
 
 load_dotenv()
 app = FastAPI(title="Prestige ERP Catalogue OCR", version="0.2.0")
@@ -26,11 +29,14 @@ app.add_middleware(
 EXTRACTOR = Path(__file__).parent / "extractor" / "catalogue_extractor.py"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 EXTRACTION_TIMEOUT_SECONDS = 180
+COMPRESSION_TIMEOUT_SECONDS = 90
+COMPRESSION_ATTEMPTS = 2
 TEMP_ROOT = Path(tempfile.gettempdir()) / "prestige-erp-catalogue-ocr"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 TARGET_BYTES = 4 * 1024 * 1024
 ILOVEPDF_PUBLIC_KEY_ENV = "ILOVEAPI_PUBLIC_KEY"
 ILOVEPDF_SECRET_KEY_ENV = "ILOVEAPI_SECRET_KEY"
+logger = logging.getLogger(__name__)
 
 
 def _job_dir(token: str) -> Path:
@@ -50,21 +56,39 @@ def _compress_pdf(source: Path, destination: Path) -> None:
             status_code=503,
             detail=f"{ILOVEPDF_PUBLIC_KEY_ENV} and {ILOVEPDF_SECRET_KEY_ENV} must be configured",
         )
-    try:
-        from ilovepdf import CompressTask
+    from ilovepdf import CompressTask
 
-        task = CompressTask(public_key=public_key, secret_key=secret_key)
-        task.compression_level = "extreme"
-        task.add_file(str(source))
-        task.execute()
-        task.download(str(destination.parent))
-        downloaded = destination.parent / source.name
-        if downloaded != destination:
-            downloaded.replace(destination)
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=f"iLoveAPI PDF compression failed: {error}") from error
+    last_error: Exception | None = None
+    deadline = time.monotonic() + COMPRESSION_TIMEOUT_SECONDS
+    for attempt in range(1, COMPRESSION_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            task = CompressTask(public_key=public_key, secret_key=secret_key)
+            task.server.timeout = min(45, max(1, int(remaining)))
+            task.server.timeout_large = min(45, max(1, int(remaining)))
+            task.compression_level = "extreme"
+            task.add_file(str(source))
+            task.execute()
+            task.download(str(destination.parent))
+            downloaded = destination.parent / source.name
+            if downloaded != destination:
+                downloaded.replace(destination)
+            break
+        except (AuthException, PathException, SignatureException) as error:
+            raise HTTPException(status_code=502, detail=f"iLoveAPI configuration failed: {error}") from error
+        except Exception as error:
+            last_error = error
+            logger.warning("iLoveAPI compression attempt %d/%d failed: %s", attempt, COMPRESSION_ATTEMPTS, error)
+            if attempt == COMPRESSION_ATTEMPTS:
+                break
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+    if last_error and not destination.exists():
+        raise HTTPException(
+            status_code=504 if time.monotonic() >= deadline else 502,
+            detail="PDF compression timed out" if time.monotonic() >= deadline else "iLoveAPI PDF compression failed after retries",
+        ) from last_error
     if not destination.exists():
         raise HTTPException(status_code=502, detail="iLoveAPI did not return a compressed PDF")
 
@@ -133,12 +157,21 @@ async def prepare_catalogue(
     original = directory / "original.pdf"
     compressed = directory / "compressed.pdf"
     original.write_bytes(contents)
+    started_at = time.monotonic()
     try:
         await asyncio.to_thread(_compress_pdf, original, compressed)
         original.unlink(missing_ok=True)
         import fitz
-        page_count = len(fitz.open(compressed))
+        with fitz.open(compressed) as document:
+            page_count = len(document)
         compressed_bytes = compressed.stat().st_size
+        logger.info(
+            "Prepared catalogue token=%s original_bytes=%d compressed_bytes=%d duration_seconds=%.2f",
+            token,
+            len(contents),
+            compressed_bytes,
+            time.monotonic() - started_at,
+        )
         return {
             "token": token,
             "originalBytes": len(contents),
@@ -148,6 +181,7 @@ async def prepare_catalogue(
             "pageCount": page_count,
         }
     except Exception:
+        logger.exception("Catalogue preparation failed token=%s duration_seconds=%.2f", token, time.monotonic() - started_at)
         shutil.rmtree(directory, ignore_errors=True)
         raise
 
