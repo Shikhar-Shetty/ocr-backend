@@ -143,6 +143,11 @@ GENERAL_SKU_REGEX = re.compile(
     r"\b(?=[A-Z0-9_/\-]*[A-Z])(?=[A-Z0-9_/\-]*\d)[A-Z0-9][A-Z0-9_/\-]{2,}\b",
     re.IGNORECASE,
 )
+NUMERIC_CODE_LINE_REGEX = re.compile(r"^\s*(?:#\s*|no\.?\s*)?(\d{4,8})\s*$", re.IGNORECASE)
+MEASUREMENT_PHRASE_REGEX = re.compile(
+    r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*(?:mm|cm|mtrs?|inches|inch|in|ft|feet|pcs|pc|sqm|sqft|kg)(?![A-Za-z])",
+    re.IGNORECASE,
+)
 UNIT_TOKEN_REGEX = re.compile(
     r"^\d+(?:\.\d+)?(?:mm|cm|pcs|pc|pkts?|sqm|sqft|kg|gm|g|mtr|ft|in|x\d+.*)$", re.IGNORECASE
 )
@@ -192,6 +197,9 @@ NON_NAME_EXACT = {
     "glazed vitrified tiles", "glazed vitrified", "vitrified", "tiles", "floor tiles",
     "wall tiles", "size:", "size", "random", "polished vitrified tiles", "ceramic tiles",
     "porcelain tiles", "matt", "matte", "satin", "rustic", "floor", "wall",
+    # page navigation, never a product name
+    "index", "tap to", "tap to index", "back to index", "go to index", "contents", "home",
+    "next", "previous", "next page", "previous page", "click here",
 }
 NON_NAME_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in (
@@ -719,6 +727,11 @@ def is_name_eligible(text: str) -> bool:
     low = text.lower()
     if LABEL_RE.match(low) or CODE_REGEX.fullmatch(text):
         return False
+    # A measurement ('1200mm', '9 MM', '800x') is never a name: it needs a real word of 2+ letters.
+    rest = MEASUREMENT_PHRASE_REGEX.sub(" ", text)
+    words = [w for w in rest.split() if not (is_dimension_token(w) or UNIT_TOKEN_REGEX.match(w))]
+    if not any(re.search(r"[A-Za-z]{2,}", w) for w in words):
+        return False
     if low in NON_NAME_EXACT or low in KNOWN_SURFACES_LOWER or low in KNOWN_MATERIALS_LOWER or low in KNOWN_BRANDS_LOWER:
         return False
     if any(p.search(low) for p in NON_NAME_PATTERNS):
@@ -936,7 +949,25 @@ def is_valid_sku(token: str, line_text: str = "", span: Optional[Tuple[int, int]
     return True
 
 
+def numeric_code_from_line(text: str) -> Optional[str]:
+    """
+    A design code printed on its own line as a bare number ('20001'). Many tile catalogues identify
+    designs only by such a number. Years (1900-2099) are not codes; neither are sizes or page numbers
+    (those are 1-3 digits or contain units and are rejected elsewhere).
+    """
+    m = NUMERIC_CODE_LINE_REGEX.match(text or "")
+    if not m:
+        return None
+    code = m.group(1)
+    if len(code) == 4 and 1900 <= int(code) <= 2099:
+        return None
+    return code
+
+
 def sku_tokens_from_line(text: str) -> List[Tuple[str, bool]]:
+    numeric = numeric_code_from_line(text)
+    if numeric:
+        return [(numeric, False)]
     labeled_matches = list(SKU_LABEL_REGEX.finditer(text))
     if labeled_matches:
         labeled, found = True, [(m.group(1), m.span(1)) for m in labeled_matches]
@@ -952,19 +983,29 @@ def sku_tokens_from_line(text: str) -> List[Tuple[str, bool]]:
     return out
 
 
-def extract_sku_candidates(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _is_prominent(line: Dict[str, Any], body: float) -> bool:
+    """Set larger than body text or in a heavier weight - how catalogues print a design code."""
+    size = line.get("size", 0.0)
+    return bool(line.get("bold")) or (body > 0 and size >= body * 1.15)
+
+
+def extract_sku_candidates(lines: List[Dict[str, Any]], body: float = 0.0) -> List[Dict[str, Any]]:
     seen = set()
     candidates = []
     for line in lines:
         if line.get("template"):
             continue
         for token, labeled in sku_tokens_from_line(line["text"]):
+            numeric = token.isdigit()
+            # A bare number is only a code when it is printed like one (big or bold), never body text.
+            if numeric and not _is_prominent(line, body):
+                continue
             key = token.upper()
             if key in seen:
                 continue
             seen.add(key)
             candidates.append({
-                "text": token, "bbox": list(line["bbox"]), "labeled": labeled,
+                "text": token, "bbox": list(line["bbox"]), "labeled": labeled, "numeric": numeric,
                 "source": line.get("source", "native"), "conf": line.get("conf", 1.0),
                 "size": line.get("size", 0.0), "bold": line.get("bold", False), "multiline": False,
             })
@@ -978,6 +1019,8 @@ def score_sku(c: Dict[str, Any], ctx: Dict[str, Any]) -> float:
         score += 2.5
     if re.search(r"[A-Za-z]", token) and re.search(r"\d", token):
         score += 1.0
+    if c.get("numeric"):
+        score += 1.0  # a standalone, prominently printed design number (already filtered for that)
     if re.search(r"[-_/]", token):
         score += 0.5
     if 4 <= len(token) <= 12:
@@ -1860,6 +1903,28 @@ def learn_name_style(states: List[Dict[str, Any]], profile: DocProfile) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def stacked_label_value(lines: List[Dict[str, Any]], label: str) -> Optional[str]:
+    """
+    Value printed directly BELOW a label in a spec strip ("RANDOM" over "06", "SURFACE" over "MATT").
+    Reading order puts all labels first and all values after, so a regex over the text cannot pair them.
+    """
+    labels = [l for l in lines if normalize_text_key(l["text"]) == label]
+    for lab in labels:
+        lx0, ly0, lx1, ly1 = lab["bbox"]
+        height = max(1.0, ly1 - ly0)
+        mid = (ly0 + ly1) / 2.0
+        # Below = starts under the label's midline (line boxes overlap with tight leading) and no more
+        # than about one and a half lines further down, left-aligned with the label.
+        below = [
+            l for l in lines
+            if l is not lab and l["bbox"][1] > mid and l["bbox"][1] - ly1 <= height * 1.5
+            and abs(l["bbox"][0] - lx0) <= max(8.0, 0.3 * (lx1 - lx0))
+        ]
+        if below:
+            return min(below, key=lambda l: l["bbox"][1])["text"].strip()
+    return None
+
+
 def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfile, doc_brand: Optional[str]) -> Dict[str, Any]:
     page_no = state["pageNo"]
     lines = card["lines"]
@@ -1870,7 +1935,8 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
     img_conf = card.get("imageConf", 0.0)
 
     # SKU first (its position helps the name ranking)
-    sku_rank = rank_candidates(extract_sku_candidates(lines), _card_ctx(card, state, profile), "sku")
+    base_ctx = _card_ctx(card, state, profile)
+    sku_rank = rank_candidates(extract_sku_candidates(lines, base_ctx["body"]), base_ctx, "sku")
     sku_text = sku_rank[0]["value"] if sku_rank else None
     sku_conf = sku_rank[0]["confidence"] if sku_rank else 0.0
     sku = sku_text.upper() if sku_text else None
@@ -1881,10 +1947,18 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
         SIZE_REGEX.search(l["text"]) or PCS_BOX_REGEX.search(l["text"]) or LABEL_RE.match(l["text"].lower()))]
     if sku:
         ctx["exclude_text"] = sku.lower()
-    name_cands = build_name_candidates(lines, profile, state["height"])
-    if not name_cands:  # everything was template text: fall back to it rather than leave the name empty
+    # The SKU is an identifier, never a name: a candidate that is just the code is not considered.
+    sku_key = normalize_text_key(sku or "")
+    name_cands = [c for c in build_name_candidates(lines, profile, state["height"])
+                  if not sku_key or normalize_text_key(c["text"]) != sku_key]
+    if not name_cands and not sku:
+        # Everything was template text and there is no code to link this card to another page with:
+        # fall back to the template text rather than leave the name empty.
         relaxed = [{**l, "template": False} for l in lines if not is_page_number_line(l["text"])]
         name_cands = build_name_candidates(relaxed, profile, state["height"])
+    # With an SKU and no name text, the name stays unresolved: grouping by SKU later borrows a real
+    # name from another page that carries the same code, and page furniture ("TAP TO INDEX") is
+    # never promoted to a name.
     name_rank = rank_candidates(name_cands, ctx, "name")
     if name_rank:
         name, name_conf = name_rank[0]["value"], name_rank[0]["confidence"]
@@ -1946,8 +2020,12 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
     images_payload = []
     if best_img:
         images_payload.append({**best_img, "isPrimary": True, "confidence": img_conf})
+    # On a single-product page every other image (faces, close-ups) shows this same tile, so they
+    # belong to the swatch. On a grid page they are only guesses at another product's picture.
+    same_product = card.get("layout") == "single"
     for alt_img, alt_conf in card.get("alts", []):
-        images_payload.append({**alt_img, "isPrimary": False, "isAlternate": True, "confidence": alt_conf})
+        images_payload.append({**alt_img, "isPrimary": False, "isAlternate": not same_product,
+                               "isSwatchImage": same_product, "confidence": alt_conf})
 
     attributes = []
     if specs.get("size"):
@@ -1963,8 +2041,9 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
     if specs.get("coveragePerBox"):
         attributes.append({"name": "Coverage per Box", "value": f"{specs['coveragePerBox']} Sqm"})
     rf_match = re.search(r"\bRandom\s*[-:]?\s*(\d+)\b", card_text, re.IGNORECASE)
-    if rf_match:
-        attributes.append({"name": "Random Faces", "value": f"{rf_match.group(1)} Faces"})
+    faces = rf_match.group(1) if rf_match else stacked_label_value(lines, "random")
+    if faces and faces.isdigit():
+        attributes.append({"name": "Random Faces", "value": f"{int(faces)} Faces"})
 
     return {
         "sourcePage": page_no,
@@ -2041,6 +2120,9 @@ def finalize_page(state: Dict[str, Any], profile: DocProfile, doc_brand: Optiona
 # --------------------------------------------------------------------------------------
 
 
+SWATCH_NAME_MIN_CONFIDENCE = 0.55
+
+
 def canonical_sku(code: Optional[str]) -> Optional[str]:
     sku = re.sub(r"[^A-Z0-9]", "", (code or "").upper())
     return sku if len(sku) >= 3 else None
@@ -2089,6 +2171,10 @@ def _swatch_rank(p: Dict[str, Any]) -> Tuple:
     """Which record of a swatch group leads it: has an SKU, a resolved name, confidence, an image."""
     return (
         0 if canonical_sku(p.get("productCode")) else 1,
+        # The record printed with the specs (size) and the flat tile faces leads, so a face - not a
+        # room preview - is the swatch's primary image. A name found elsewhere is borrowed later.
+        0 if p.get("size") else 1,
+        -sum(1 for img in p.get("images", []) if not img.get("isAlternate")),
         0 if swatch_name_key(p) else 1,
         -float(p.get("confidence") or 0.0),
         0 if p.get("primaryImageUrl") else 1,
@@ -2110,9 +2196,10 @@ def _merge_swatch(leader: Dict[str, Any], members: List[Dict[str, Any]]) -> None
         return img.get("sha256") or img.get("url") or img.get("id") or ""
 
     primary = [img for img in leader["images"] if img.get("isPrimary")]
-    alternates = [img for img in leader["images"] if not img.get("isPrimary")]
-    ordered: List[Dict[str, Any]] = list(primary)
-    seen = {image_key(img) for img in primary}
+    own = [img for img in leader["images"] if not img.get("isPrimary") and not img.get("isAlternate")]
+    alternates = [img for img in leader["images"] if img.get("isAlternate")]
+    ordered: List[Dict[str, Any]] = primary + own
+    seen = {image_key(img) for img in ordered}
     for member in members:
         for img in member["images"]:
             if img.get("isAlternate") or image_key(img) in seen:
@@ -2136,7 +2223,14 @@ def _merge_swatch(leader: Dict[str, Any], members: List[Dict[str, Any]]) -> None
             for field in ("productName", "productNameOriginal", "ocrNameCandidates", "strippedNamePrefix"):
                 if field in best:
                     leader[field] = best[field]
-            leader["reviewWarnings"] = [w for w in leader["reviewWarnings"] if "name could not" not in w]
+            name_conf = (best.get("confidenceBreakdown") or {}).get("name")
+            if name_conf is not None:
+                leader.setdefault("confidenceBreakdown", {})["name"] = name_conf
+            if name_conf is None or name_conf >= 0.55:
+                leader["reviewWarnings"] = [w for w in leader["reviewWarnings"] if "name could not" not in w]
+            leader["reviewWarnings"].append(
+                f"Name '{best['productName']}' taken from page {best.get('sourcePage')}, which shares this SKU."
+            )
 
     # SKU: a leader without one takes it (with its candidates and status) from a member.
     if not canonical_sku(leader.get("productCode")):
@@ -2173,6 +2267,9 @@ def _merge_swatch(leader: Dict[str, Any], members: List[Dict[str, Any]]) -> None
     for member in members:
         pages.update(member.get("sourcePages", [member["sourcePage"]]))
     leader["sourcePages"] = sorted(pages)
+    leader["description"] = (
+        f"{leader.get('productName')} - {leader.get('size') or ''} {leader.get('surface') or ''}".strip()
+    )
 
 
 def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2225,7 +2322,10 @@ def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         if sku:
             by_sku[sku].append(idx)
         name = swatch_name_key(p)
-        if name:
+        # Only a confidently read name may link records: a misread name (e.g. a size fragment that
+        # repeats on every page) would otherwise collapse unrelated designs into one swatch.
+        name_conf = (p.get("confidenceBreakdown") or {}).get("name") or 0.0
+        if name and name_conf >= SWATCH_NAME_MIN_CONFIDENCE:
             by_name[name].append(idx)
     for idxs in by_sku.values():
         for other in idxs[1:]:

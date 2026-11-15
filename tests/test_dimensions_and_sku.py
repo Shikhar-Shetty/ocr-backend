@@ -99,5 +99,41 @@ class SkuValidationTests(unittest.TestCase):
         self.assertEqual(ce.clean_name_text("Calacatta Gold 800x"), "Calacatta Gold")
 
 
+class NumericDesignCodeTests(unittest.TestCase):
+    """Catalogues such as '800X1200 MATT 2026' identify designs only by a number ('20001')."""
+
+    def line(self, text, size=10.0, bold=False):
+        return {"text": text, "bbox": [0, 0, 50, 10], "size": size, "bold": bold, "conf": 1.0,
+                "source": "native", "template": False}
+
+    def test_standalone_number_is_a_code(self):
+        self.assertEqual(ce.numeric_code_from_line("20001"), "20001")
+        self.assertEqual(ce.numeric_code_from_line("# 20001"), "20001")
+
+    def test_years_and_short_numbers_are_not_codes(self):
+        self.assertIsNone(ce.numeric_code_from_line("2026"))
+        self.assertIsNone(ce.numeric_code_from_line("06"))
+        self.assertIsNone(ce.numeric_code_from_line("Call 98450 12345"))
+
+    def test_numeric_code_must_be_prominent(self):
+        lines = [self.line("20001", size=30.0, bold=True), self.line("12345", size=10.0)]
+        codes = [c["text"] for c in ce.extract_sku_candidates(lines, body=11.0)]
+        self.assertEqual(codes, ["20001"])
+
+    def test_measurements_are_never_names(self):
+        for text in ("1200mm", "800x", "9 MM", "1200 mm"):
+            self.assertFalse(ce.is_name_eligible(text), text)
+        self.assertTrue(ce.is_name_eligible("SEA SAND BEIGE"))
+
+    def test_stacked_spec_strip(self):
+        lines = [
+            {"text": "SURFACE", "bbox": [222, 746, 309, 764]}, {"text": "RANDOM", "bbox": [347, 746, 433, 764]},
+            {"text": "MATT", "bbox": [222, 763, 273, 781]}, {"text": "06", "bbox": [347, 763, 369, 781]},
+        ]
+        self.assertEqual(ce.stacked_label_value(lines, "random"), "06")
+        self.assertEqual(ce.stacked_label_value(lines, "surface"), "MATT")
+        self.assertIsNone(ce.stacked_label_value(lines, "pcs"))
+
+
 if __name__ == "__main__":
     unittest.main()
