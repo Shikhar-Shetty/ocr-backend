@@ -104,10 +104,34 @@ KNOWN_BRANDS_LOWER = {b.lower() for b in KNOWN_BRANDS}
 KNOWN_SURFACES_LOWER = {s.lower() for s in KNOWN_SURFACES}
 KNOWN_MATERIALS_LOWER = {m.lower() for m in KNOWN_MATERIALS}
 
+# --- Dimensions -----------------------------------------------------------------------
+# A tile size is "A x B" with an optional thickness "x T", optional units on any side and
+# "x", "X", "×" or "*" as the separator: 800x1600, 800 X 1600 MM, 80x160cm, 800mm x 1600mm,
+# 800x1600x9mm, 2x2 ft, 12"x18". Named groups: a, ua, b, ub (unit), t, ut (thickness).
+_DIM_NUM = r"\d{1,4}(?:\.\d{1,2})?"
+_DIM_UNIT = r"(?:mm|cm|mtrs?|inches|inch|in|feet|ft|'|\")"
+_DIM_SEP = r"[xX×*]"
 SIZE_REGEX = re.compile(
-    r"\b(\d{2,4})\s*(?:[xX×*])\s*(\d{2,4})\s*(mm|cm|in|inch|inches)?\b",
+    rf"(?<![A-Za-z0-9.])(?P<a>{_DIM_NUM})\s*(?P<ua>{_DIM_UNIT})?\s*{_DIM_SEP}\s*"
+    rf"(?P<b>{_DIM_NUM})\s*(?P<ub>{_DIM_UNIT})?"
+    rf"(?:\s*{_DIM_SEP}\s*(?P<t>\d{{1,2}}(?:\.\d{{1,2}})?)\s*(?P<ut>mm|cm)?)?"
+    rf"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# Half of a size that was split by a line break or a bad OCR read: "800x" / "x1600".
+DIM_FRAGMENT_REGEX = re.compile(
+    rf"(?<![A-Za-z0-9.])(?:{_DIM_NUM}\s*(?:mm|cm)?\s*{_DIM_SEP}(?![A-Za-z0-9])"
+    rf"|{_DIM_SEP}\s*\d{{2,4}}(?:\.\d{{1,2}})?\s*(?:mm|cm)?(?![A-Za-z0-9]))",
+    re.IGNORECASE,
+)
+# A whole token that is nothing but a size, a size fragment or a measurement.
+DIM_TOKEN_REGEX = re.compile(
+    rf"^{_DIM_SEP}?\d{{1,4}}(?:\.\d{{1,2}})?(?:mm|cm|in|inch|ft)?"
+    rf"(?:{_DIM_SEP}\d{{0,4}}(?:\.\d{{1,2}})?(?:mm|cm|in|inch|ft)?){{0,2}}$",
+    re.IGNORECASE,
+)
+# Plausible tile edge length per unit (anything outside is not a tile size).
+DIM_LIMITS = {"mm": (50.0, 4000.0), "cm": (5.0, 400.0), "inch": (2.0, 120.0), "ft": (1.0, 12.0)}
 
 CODE_REGEX = re.compile(r"\b([A-Z]{1,6}[-_/ ]?[0-9]{2,6}(?:[-_/ ][A-Z0-9]+)?)\b")
 SKU_LABEL_REGEX = re.compile(
@@ -188,6 +212,21 @@ COVERAGE_REGEX = re.compile(
 PRICE_REGEX = re.compile(r"(?:MRP|Price|Rs\.?|₹)\s*[:.-]?\s*(\d+(?:[.,]\d{2})?)", re.IGNORECASE)
 PAGE_NUMBER_REGEX = re.compile(r"^(?:page\s*)?\d{1,3}(?:\s*/\s*\d{1,3})?$", re.IGNORECASE)
 
+# Words that describe HOW a tile is shown, not WHICH tile it is. "Calacatta Gold Close-up" and
+# "Calacatta Gold - Room View" are both the swatch "Calacatta Gold".
+VIEW_QUALIFIER_REGEX = re.compile(
+    r"\b(?:"
+    r"close\s*-?\s*up(?:\s*view)?|closeup|zoom(?:ed)?(?:\s*-?\s*in)?|preview|"
+    r"room\s*(?:view|shot|scene|image)|in\s*-?\s*situ|"
+    r"details?\s*(?:view|shot)|texture\s*(?:view|shot)|surface\s*view|"
+    r"application\s*(?:view|image|shot)|installed\s*view|installation\s*view|"
+    r"lifestyle\s*(?:view|image|shot)?|ambience\s*(?:view|image|shot)?|mood\s*(?:shot|image|board)|"
+    r"(?:random\s*)?faces?(?:\s*-?\s*\d{1,2})?|"
+    r"(?:full|front|top|side|angle|corner)\s*view"
+    r")\b",
+    re.IGNORECASE,
+)
+
 SQFT_TO_SQM = 0.092903
 UNRESOLVED_NAME = "Unresolved product name"
 MAX_GROUP_COST = 2.2  # text block further than this from every image is not attached to one
@@ -219,6 +258,97 @@ def is_url_like(text: str) -> bool:
 
 def is_page_number_line(text: str) -> bool:
     return bool(PAGE_NUMBER_REGEX.match(text.strip()))
+
+
+# --------------------------------------------------------------------------------------
+# Dimension detection
+# --------------------------------------------------------------------------------------
+
+
+def _canonical_unit(unit: Optional[str]) -> Optional[str]:
+    if not unit:
+        return None
+    u = unit.lower()
+    if u == "mm":
+        return "mm"
+    if u == "cm":
+        return "cm"
+    if u.startswith("mtr"):
+        return "m"
+    if u in ("in", "inch", "inches", '"'):
+        return "inch"
+    if u in ("ft", "feet", "'"):
+        return "ft"
+    return None
+
+
+def _fmt_num(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def detect_unit_hint(text: str) -> Optional[str]:
+    """The unit a document states for its sizes ("Size (cm)", "All sizes in mm"), if any."""
+    m = re.search(r"\b(?:size|sizes|dimensions?)\b[^\n]{0,20}?\(?\s*(?:in\s+)?(mm|cm|inch(?:es)?|ft|feet)\b",
+                  text, re.IGNORECASE)
+    return _canonical_unit(m.group(1)) if m else None
+
+
+def parse_dimension(text: str, unit_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    First plausible tile size in `text`, normalised.
+
+    Returns {"raw", "width", "height", "unit", "size", "thickness", "unitStated"}. Explicit units win;
+    otherwise `unit_hint`; otherwise the magnitude decides (>= 50 is mm, <= 12 is feet). A size whose
+    unit cannot be inferred (e.g. a bare "30x60") is returned with unit None so the caller can ask for
+    review instead of guessing. Implausible values (an "8x2" in a sentence) are skipped.
+    """
+    for m in SIZE_REGEX.finditer(text or ""):
+        a, b = float(m.group("a")), float(m.group("b"))
+        stated = _canonical_unit(m.group("ub") or m.group("ua"))
+        unit = stated or unit_hint
+        if unit is None:
+            if min(a, b) >= 50:
+                unit = "mm"
+            elif max(a, b) <= 12:
+                unit = "ft"
+        if unit == "m":
+            a, b, unit = a * 1000, b * 1000, "mm"
+        if unit is not None:
+            low, high = DIM_LIMITS[unit]
+            if not (low <= a <= high and low <= b <= high):
+                continue
+        elif not (10 <= a <= 400 and 10 <= b <= 400):
+            continue
+        if unit == "cm":  # catalogues sell in cm, the ERP stores mm
+            a, b, unit = a * 10, b * 10, "mm"
+        thickness = None
+        if m.group("t"):
+            t = float(m.group("t")) * (10 if (m.group("ut") or "").lower() == "cm" else 1)
+            if 3 <= t <= 30:
+                thickness = f"{_fmt_num(t)} mm"
+        size = f"{_fmt_num(a)}x{_fmt_num(b)}" + (f" {unit}" if unit else "")
+        return {
+            "raw": m.group(0).strip(), "width": a, "height": b, "unit": unit, "size": size,
+            "thickness": thickness, "unitStated": stated is not None,
+        }
+    return None
+
+
+def dimension_spans(text: str) -> List[Tuple[int, int]]:
+    """Character spans of every size and size fragment in a line."""
+    spans = [m.span() for m in SIZE_REGEX.finditer(text)]
+    for m in DIM_FRAGMENT_REGEX.finditer(text):
+        if not any(s <= m.start() and m.end() <= e for s, e in spans):
+            spans.append(m.span())
+    return spans
+
+
+def is_dimension_token(token: str) -> bool:
+    """True for '800X', 'X1600', '800X1600', '800X1600X9MM', '9MM' - a measurement, never an SKU."""
+    value = token.strip().strip("-_/")
+    if not DIM_TOKEN_REGEX.match(value):
+        return False
+    return bool(re.search(r"[xX×*]|mm|cm|in|ft", value, re.IGNORECASE))
 
 
 def bbox_union(boxes: List[List[float]]) -> List[float]:
@@ -576,6 +706,7 @@ def mark_template_lines(lines: List[Dict[str, Any]], profile: DocProfile) -> Non
 
 def clean_name_text(text: str) -> str:
     value = SIZE_REGEX.sub(" ", text)
+    value = DIM_FRAGMENT_REGEX.sub(" ", value)
     value = PRICE_REGEX.sub(" ", value)
     return re.sub(r"\s+", " ", value).strip(" -–|:,/")
 
@@ -785,18 +916,37 @@ def score_name(c: Dict[str, Any], ctx: Dict[str, Any]) -> float:
     return score
 
 
+def is_valid_sku(token: str, line_text: str = "", span: Optional[Tuple[int, int]] = None) -> bool:
+    """
+    SKU validation. A code must contain a digit and must not be a measurement: it may not look like
+    a size or size fragment on its own ('800X' from '800x 1600', '800X1600X9MM', '9MM'), and it may
+    not sit entirely inside a size printed on its line. A real code that merely CONTAINS a size
+    ('VZ-800X1600-CAL') is still valid.
+    """
+    if not (3 <= len(token) <= 20) or not re.search(r"\d", token):
+        return False
+    if is_url_like(token) or ISO_CODE_REGEX.fullmatch(token) or UNIT_TOKEN_REGEX.match(token):
+        return False
+    if SIZE_REGEX.fullmatch(token) or is_dimension_token(token):
+        return False
+    if span and line_text:
+        start, end = span
+        if any(s <= start and end <= e for s, e in dimension_spans(line_text)):
+            return False
+    return True
+
+
 def sku_tokens_from_line(text: str) -> List[Tuple[str, bool]]:
     labeled_matches = list(SKU_LABEL_REGEX.finditer(text))
     if labeled_matches:
-        labeled, tokens = True, [m.group(1) for m in labeled_matches]
+        labeled, found = True, [(m.group(1), m.span(1)) for m in labeled_matches]
     else:
-        labeled, tokens = False, [m.group(0) for m in GENERAL_SKU_REGEX.finditer(text)]
+        labeled, found = False, [(m.group(0), m.span(0)) for m in GENERAL_SKU_REGEX.finditer(text)]
     out = []
-    for token in tokens:
-        token = token.strip("-_/")
-        if not (3 <= len(token) <= 20) or not re.search(r"\d", token):
-            continue
-        if is_url_like(token) or SIZE_REGEX.fullmatch(token) or ISO_CODE_REGEX.fullmatch(token) or UNIT_TOKEN_REGEX.match(token):
+    for raw, (start, end) in found:
+        token = raw.strip("-_/")
+        offset = raw.find(token)
+        if not is_valid_sku(token, text, (start + offset, start + offset + len(token))):
             continue
         out.append((token, labeled))
     return out
@@ -1212,24 +1362,20 @@ def extract_composite_crops(
 # --------------------------------------------------------------------------------------
 
 
-def extract_tile_specifications(text: str) -> Dict[str, Any]:
+def extract_tile_specifications(text: str, unit_hint: Optional[str] = None) -> Dict[str, Any]:
     specs: Dict[str, Any] = {
-        "size": None, "sizeRaw": None, "surface": None, "material": None, "color": None,
+        "size": None, "sizeRaw": None, "sizeUnitKnown": True, "thickness": None,
+        "surface": None, "material": None, "color": None,
         "piecesPerBox": None, "coveragePerBox": None, "mrp": None, "sellingPrice": None,
         "hsnCode": "6907", "gstRate": 18, "unit": "box",
     }
 
-    size_match = SIZE_REGEX.search(text)
-    if size_match:
-        dim1, dim2 = int(size_match.group(1)), int(size_match.group(2))
-        unit = (size_match.group(3) or "").lower()
-        specs["sizeRaw"] = size_match.group(0).strip()
-        if unit == "cm":
-            specs["size"] = f"{dim1 * 10}x{dim2 * 10} mm"
-        elif unit in ("in", "inch", "inches"):
-            specs["size"] = f"{dim1}x{dim2} inch"
-        else:
-            specs["size"] = f"{dim1}x{dim2} mm"
+    dimension = parse_dimension(text, unit_hint or detect_unit_hint(text))
+    if dimension:
+        specs["size"] = dimension["size"]
+        specs["sizeRaw"] = dimension["raw"]
+        specs["sizeUnitKnown"] = dimension["unit"] is not None
+        specs["thickness"] = dimension["thickness"]
 
     surf_explicit = re.search(r"Surface\s*(?:/\s*Finish)?\s*[:.-]\s*([^\n·,;]+)", text, re.IGNORECASE)
     if surf_explicit:
@@ -1458,9 +1604,9 @@ def rank_single_page_images(images: List[Dict[str, Any]], size_text: Optional[st
                             out_dir: str) -> List[Tuple[float, Dict[str, Any]]]:
     """Best swatch first: its shape matches the tile size, it is a flat texture (not a 3D corner shot)."""
     size_ratio = None
-    m = SIZE_REGEX.search(size_text or "")
-    if m and int(m.group(2)) > 0:
-        size_ratio = int(m.group(1)) / int(m.group(2))
+    dimension = parse_dimension(size_text or "")
+    if dimension and dimension["height"] > 0:
+        size_ratio = dimension["width"] / dimension["height"]
     max_area = max((img["pixelWidth"] * img["pixelHeight"] for img in images), default=1) or 1
     ranked = []
     for img in images:
@@ -1752,11 +1898,12 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
         if margin >= 0.8 and name_rank[0]["score"] >= 1.0:
             name_conf = max(name_conf, 0.6)  # the only product on the page and a clear winner
 
-    specs = extract_tile_specifications(card_text)
+    unit_hint = detect_unit_hint(card_text) or detect_unit_hint(total_text)
+    specs = extract_tile_specifications(card_text, unit_hint)
     if not specs["size"]:
-        page_specs = extract_tile_specifications(total_text)
-        for key in ("size", "sizeRaw", "surface", "material"):
-            if not specs.get(key) and page_specs.get(key):
+        page_specs = extract_tile_specifications(total_text, unit_hint)
+        for key in ("size", "sizeRaw", "sizeUnitKnown", "thickness", "surface", "material"):
+            if not specs.get(key) and page_specs.get(key) is not None:
                 specs[key] = page_specs[key]
 
     category = "Floor Tiles"
@@ -1788,6 +1935,8 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
         warnings.append(f"Low image matching confidence ({int(img_conf * 100)}%); verify image.")
     if not specs["size"]:
         warnings.append("Size/dimension not detected in text.")
+    elif not specs.get("sizeUnitKnown", True):
+        warnings.append(f"Size '{specs['sizeRaw']}' has no unit (mm / cm / inch); verify the size.")
     if stripped_prefix:
         warnings.append(f"Template prefix '{stripped_prefix}' was removed from the name (original kept).")
     if len(name_rank) > 1 and name_rank[0]["score"] - name_rank[1]["score"] < 0.4 \
@@ -1803,6 +1952,8 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
     attributes = []
     if specs.get("size"):
         attributes.append({"name": "Size", "value": specs["size"]})
+    if specs.get("thickness"):
+        attributes.append({"name": "Thickness", "value": specs["thickness"]})
     if specs.get("surface"):
         attributes.append({"name": "Surface / Finish", "value": specs["surface"]})
     if specs.get("material"):
@@ -1890,64 +2041,240 @@ def finalize_page(state: Dict[str, Any], profile: DocProfile, doc_brand: Optiona
 # --------------------------------------------------------------------------------------
 
 
-def product_key(p: Dict[str, Any]) -> Optional[str]:
-    sku = re.sub(r"[^A-Z0-9]", "", (p.get("productCode") or "").upper())
-    if len(sku) >= 3:
-        return "sku:" + sku
-    name = normalize_text_key(p.get("productName") or "")
-    if not name or name == normalize_text_key(UNRESOLVED_NAME):
+def canonical_sku(code: Optional[str]) -> Optional[str]:
+    sku = re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+    return sku if len(sku) >= 3 else None
+
+
+def strip_view_qualifiers(name: str) -> str:
+    """'Calacatta Gold (Close-up)' -> 'Calacatta Gold'. Returns the input if nothing usable is left."""
+    stripped = VIEW_QUALIFIER_REGEX.sub(" ", name or "")
+    stripped = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", stripped)  # brackets left empty
+    stripped = re.sub(r"\s+", " ", stripped).strip(" -–|:,/()[]")
+    return stripped if len(stripped) >= 3 else (name or "")
+
+
+def swatch_name_key(p: Dict[str, Any]) -> Optional[str]:
+    name = p.get("productName") or ""
+    if not name or name == UNRESOLVED_NAME:
         return None
-    return f"nm:{name}|{p.get('size') or ''}|{(p.get('surface') or '').lower()}"
+    key = normalize_text_key(strip_view_qualifiers(name))
+    return key or None
+
+
+def _size_key(p: Dict[str, Any]) -> Optional[str]:
+    return re.sub(r"[^0-9x]", "", (p.get("size") or "").lower()) or None
+
+
+def _surface_key(p: Dict[str, Any]) -> Optional[str]:
+    return normalize_text_key(p.get("surface") or "") or None
+
+
+def product_key(p: Dict[str, Any]) -> Optional[str]:
+    sku = canonical_sku(p.get("productCode"))
+    if sku:
+        return "sku:" + sku
+    name = swatch_name_key(p)
+    return f"nm:{name}|{_size_key(p) or ''}" if name else None
 
 
 def _names_compatible(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    na, nb = a.get("productName") or "", b.get("productName") or ""
-    if UNRESOLVED_NAME in (na, nb):
+    na, nb = swatch_name_key(a), swatch_name_key(b)
+    if not na or not nb:
         return True
-    return SequenceMatcher(None, normalize_text_key(na), normalize_text_key(nb)).ratio() >= 0.7
+    return SequenceMatcher(None, na, nb).ratio() >= 0.7
+
+
+def _swatch_rank(p: Dict[str, Any]) -> Tuple:
+    """Which record of a swatch group leads it: has an SKU, a resolved name, confidence, an image."""
+    return (
+        0 if canonical_sku(p.get("productCode")) else 1,
+        0 if swatch_name_key(p) else 1,
+        -float(p.get("confidence") or 0.0),
+        0 if p.get("primaryImageUrl") else 1,
+        p.get("sourcePage", 0),
+    )
+
+
+# Scalar fields a swatch borrows from its other records when its leader lacks them.
+_FILLABLE_FIELDS = ("size", "sizeRaw", "surface", "material", "color", "piecesPerBox",
+                    "coveragePerBox", "brandName")
+_PRICE_FIELDS = ("mrp", "sellingPrice")
+
+
+def _merge_swatch(leader: Dict[str, Any], members: List[Dict[str, Any]]) -> None:
+    """Fold `members` into `leader` in place: all their images, plus any details the leader lacks."""
+    # Images: leader's primary, then every member's own image(s), then the leader's alternates.
+    # A member's *alternates* are guesses at other tiles on its page, so they are not carried over.
+    def image_key(img: Dict[str, Any]) -> str:
+        return img.get("sha256") or img.get("url") or img.get("id") or ""
+
+    primary = [img for img in leader["images"] if img.get("isPrimary")]
+    alternates = [img for img in leader["images"] if not img.get("isPrimary")]
+    ordered: List[Dict[str, Any]] = list(primary)
+    seen = {image_key(img) for img in primary}
+    for member in members:
+        for img in member["images"]:
+            if img.get("isAlternate") or image_key(img) in seen:
+                continue
+            seen.add(image_key(img))
+            ordered.append({**img, "isPrimary": False, "isAlternate": False, "isSwatchImage": True})
+    for img in alternates:
+        if image_key(img) not in seen:
+            seen.add(image_key(img))
+            ordered.append(img)
+    leader["images"] = ordered
+    if not leader.get("primaryImageUrl") and len(ordered) > 0:
+        ordered[0]["isPrimary"] = True
+        leader["primaryImageUrl"] = ordered[0].get("url")
+
+    # Name: a leader without a readable name takes the best one in the group.
+    if not swatch_name_key(leader):
+        named = [m for m in members if swatch_name_key(m)]
+        if named:
+            best = max(named, key=lambda m: m.get("confidenceBreakdown", {}).get("name") or 0.0)
+            for field in ("productName", "productNameOriginal", "ocrNameCandidates", "strippedNamePrefix"):
+                if field in best:
+                    leader[field] = best[field]
+            leader["reviewWarnings"] = [w for w in leader["reviewWarnings"] if "name could not" not in w]
+
+    # SKU: a leader without one takes it (with its candidates and status) from a member.
+    if not canonical_sku(leader.get("productCode")):
+        coded = next((m for m in members if canonical_sku(m.get("productCode"))), None)
+        if coded:
+            for field in ("productCode", "ocrSkuCandidates", "skuStatus"):
+                leader[field] = coded.get(field)
+            if leader.get("skuStatus") == "EXTRACTED":
+                leader["reviewWarnings"] = [w for w in leader["reviewWarnings"] if "SKU could not" not in w]
+
+    for field in _FILLABLE_FIELDS:
+        if not leader.get(field):
+            donor = next((m for m in members if m.get(field)), None)
+            if donor:
+                leader[field] = donor[field]
+    for field in _PRICE_FIELDS:
+        if not leader.get(field):
+            donor = next((m for m in members if m.get(field)), None)
+            if donor:
+                leader[field] = donor[field]
+    if leader.get("size"):
+        leader["reviewWarnings"] = [w for w in leader["reviewWarnings"] if "Size/dimension not detected" not in w]
+
+    have = {a["name"] for a in leader.get("attributes", [])}
+    for member in members:
+        for attr in member.get("attributes", []):
+            if attr["name"] not in have:
+                leader.setdefault("attributes", []).append(attr)
+                have.add(attr["name"])
+
+    texts = [leader.get("rawText") or ""] + [m.get("rawText") or "" for m in members]
+    leader["rawText"] = "\n---\n".join(dict.fromkeys(t for t in texts if t))
+    pages = set(leader.get("sourcePages", [leader["sourcePage"]]))
+    for member in members:
+        pages.update(member.get("sourcePages", [member["sourcePage"]]))
+    leader["sourcePages"] = sorted(pages)
 
 
 def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Merge duplicates by SKU (or name+size+surface). Removed records are returned, not lost."""
-    groups: Dict[str, List[int]] = defaultdict(list)
+    """
+    Group records into swatches: one product per design, carrying every image of it.
+
+    A catalogue often shows one tile several times - a room preview, a close-up, random faces - and
+    each picture used to become its own product. Records are grouped when:
+      * they share an SKU (always - the SKU identifies the product), or
+      * they share a name once view words are removed ('Calacatta Gold Close-up' == 'Calacatta Gold'),
+        provided they do not carry different SKUs, sizes or surfaces (those are separate products).
+    Groups never mix two different SKUs. Folded-in records are returned, not lost.
+    """
+    n = len(products)
+    parent = list(range(n))
+    skus: List[set] = []
+    sizes: List[set] = []
+    surfaces: List[set] = []
+    for p in products:
+        p["productKey"] = product_key(p)
+        sku, size, surface = canonical_sku(p.get("productCode")), _size_key(p), _surface_key(p)
+        skus.append({sku} if sku else set())
+        sizes.append({size} if size else set())
+        surfaces.append({surface} if surface else set())
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int, by_sku: bool) -> None:
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            return
+        if len(skus[ri] | skus[rj]) > 1:
+            return  # two different SKUs are two products
+        if not by_sku and (len(sizes[ri] | sizes[rj]) > 1 or len(surfaces[ri] | surfaces[rj]) > 1):
+            return  # same name, different size or finish: separate products
+        parent[rj] = ri
+        skus[ri] |= skus[rj]
+        sizes[ri] |= sizes[rj]
+        surfaces[ri] |= surfaces[rj]
+
+    # SKU links first (strongest evidence), then name links.
+    by_sku: Dict[str, List[int]] = defaultdict(list)
+    by_name: Dict[str, List[int]] = defaultdict(list)
     for idx, p in enumerate(products):
-        key = product_key(p)
-        p["productKey"] = key
-        if key:
-            groups[key].append(idx)
+        sku = canonical_sku(p.get("productCode"))
+        if sku:
+            by_sku[sku].append(idx)
+        name = swatch_name_key(p)
+        if name:
+            by_name[name].append(idx)
+    for idxs in by_sku.values():
+        for other in idxs[1:]:
+            union(idxs[0], other, by_sku=True)
+    for idxs in by_name.values():
+        for other in idxs[1:]:
+            union(idxs[0], other, by_sku=False)
+
+    components: Dict[int, List[int]] = defaultdict(list)
+    for idx in range(n):
+        components[find(idx)].append(idx)
 
     drop = set()
     removed: List[Dict[str, Any]] = []
-    for key, idxs in groups.items():
+    for idxs in components.values():
         if len(idxs) < 2:
             continue
-        idxs.sort(key=lambda i: (-products[i]["confidence"], 0 if products[i].get("primaryImageUrl") else 1, i))
-        keeper = products[idxs[0]]
-        pages = set(keeper.get("sourcePages", [keeper["sourcePage"]]))
-        seen_images = {img.get("sha256") for img in keeper["images"]}
-        merged_n = 0
-        for i in idxs[1:]:
-            dup = products[i]
-            if not _names_compatible(keeper, dup):
-                continue  # same code but clearly different product: never merge
-            merged_n += 1
-            pages.update(dup.get("sourcePages", [dup["sourcePage"]]))
-            for img in dup["images"]:
-                if img.get("sha256") not in seen_images:
-                    keeper["images"].append({**img, "isPrimary": False, "isAlternate": True})
-                    seen_images.add(img.get("sha256"))
-            if not keeper.get("primaryImageUrl") and dup.get("primaryImageUrl"):
-                keeper["primaryImageUrl"] = dup["primaryImageUrl"]
-                for img in keeper["images"]:
-                    img["isPrimary"] = img.get("url") == keeper["primaryImageUrl"]
-            removed.append({**dup, "isDuplicate": True, "duplicateOfKey": key, "duplicateOfName": keeper["productName"]})
+        idxs.sort(key=lambda i: _swatch_rank(products[i]))
+        leader = products[idxs[0]]
+        members = [products[i] for i in idxs[1:]]
+        names_differ = any(not _names_compatible(leader, m) for m in members)
+        before = len(leader["images"])
+        _merge_swatch(leader, members)
+        added = len(leader["images"]) - before
+        leader["productKey"] = product_key(leader)
+        for i, member in zip(idxs[1:], members):
             drop.add(i)
-        keeper["sourcePages"] = sorted(pages)
-        if merged_n:
-            keeper["reviewWarnings"].append(
-                f"Merged {merged_n} duplicate record(s) from page(s) {', '.join(map(str, keeper['sourcePages']))}."
+            removed.append({**member, "isDuplicate": True, "duplicateOfKey": leader["productKey"],
+                            "duplicateOfName": leader["productName"]})
+        pages = ", ".join(map(str, leader["sourcePages"]))
+        leader["reviewWarnings"].append(
+            f"Grouped {len(members) + 1} records into one swatch ({added} extra image(s), page(s) {pages})."
+        )
+        if names_differ:
+            leader["reviewWarnings"].append(
+                "Records with this SKU had different names; verify the name and images of this swatch."
             )
-    return [p for i, p in enumerate(products) if i not in drop], removed
+            leader["needsReview"] = True
+
+    kept = [p for i, p in enumerate(products) if i not in drop]
+    # The swatch is the design, not the shot: drop view words from every name (original kept).
+    for p in kept:
+        name = p.get("productName") or ""
+        clean = strip_view_qualifiers(name)
+        if name and name != UNRESOLVED_NAME and clean != name:
+            p["productNameOriginal"] = p.get("productNameOriginal") or name
+            p["productName"] = clean
+            p["description"] = f"{clean} - {p.get('size') or ''} {p.get('surface') or ''}".strip()
+    return kept, removed
 
 
 def flag_shared_images(products: List[Dict[str, Any]]) -> None:
