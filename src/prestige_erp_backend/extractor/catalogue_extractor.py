@@ -2272,6 +2272,50 @@ def _merge_swatch(leader: Dict[str, Any], members: List[Dict[str, Any]]) -> None
     )
 
 
+def series_words(products: List[Dict[str, Any]]) -> set:
+    """
+    Words that open two or more product names ('Balistone' in 'Balistone Ash', 'Balistone Fog'): the
+    series or collection a catalogue prints before each design name. A word that is itself a whole
+    product name is never treated as a series.
+    """
+    keys = [swatch_name_key(p) for p in products]
+    keys = [k for k in keys if k]
+    whole = set(keys)
+    leading: Counter = Counter()
+    for key in set(keys):
+        words = key.split()
+        if len(words) >= 2:
+            leading[words[0]] += 1
+    return {w for w, count in leading.items() if count >= 2 and w not in whole and len(w) >= 3}
+
+
+def strip_series(key: str, series: set) -> str:
+    """'balistone royal blue' -> 'royal blue' when 'balistone' is a series word."""
+    words = key.split()
+    while len(words) > 1 and words[0] in series:
+        words = words[1:]
+    return " ".join(words)
+
+
+SERIES_LINK_MAX_PAGE_GAP = 1
+
+
+def _prefer_series_name(leader: Dict[str, Any], members: List[Dict[str, Any]], series: set) -> None:
+    """'ROYAL BLUE' + 'Balistone Royal Blue' -> the swatch is named 'Balistone Royal Blue'."""
+    key = swatch_name_key(leader)
+    if not key or not series:
+        return
+    fuller = [m for m in members
+              if (mk := swatch_name_key(m)) and mk != key and strip_series(mk, series) == key]
+    if fuller:
+        best = max(fuller, key=lambda m: (m.get("confidenceBreakdown") or {}).get("name") or 0.0)
+        leader["productName"] = best["productName"]
+        leader["productNameOriginal"] = best.get("productNameOriginal") or best["productName"]
+        leader["description"] = (
+            f"{leader['productName']} - {leader.get('size') or ''} {leader.get('surface') or ''}".strip()
+        )
+
+
 def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Group records into swatches: one product per design, carrying every image of it.
@@ -2334,6 +2378,26 @@ def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         for other in idxs[1:]:
             union(idxs[0], other, by_sku=False)
 
+    # Series links: a preview page titled 'Balistone Royal Blue' next to the swatch page whose name
+    # reads 'ROYAL BLUE' (the series line is page furniture there). Deliberately narrow: only records
+    # on adjacent pages, only a full name against its bare form (two differently prefixed names such
+    # as 'Statuario Ash' / 'Balistone Ash' never link), and the size / finish / SKU guards still apply.
+    series = series_words(products)
+    if series:
+        confident = [
+            (idx, name) for name, idxs in by_name.items() for idx in idxs
+        ]
+        for i, name_i in confident:
+            for j, name_j in confident:
+                if i >= j or name_i == name_j:
+                    continue
+                gap = abs((products[i].get("sourcePage") or 0) - (products[j].get("sourcePage") or 0))
+                if gap > SERIES_LINK_MAX_PAGE_GAP:
+                    continue
+                longer, shorter = (name_i, name_j) if len(name_i) > len(name_j) else (name_j, name_i)
+                if strip_series(shorter, series) == shorter and strip_series(longer, series) == shorter:
+                    union(i, j, by_sku=False)
+
     components: Dict[int, List[int]] = defaultdict(list)
     for idx in range(n):
         components[find(idx)].append(idx)
@@ -2346,10 +2410,14 @@ def dedupe_products(products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         idxs.sort(key=lambda i: _swatch_rank(products[i]))
         leader = products[idxs[0]]
         members = [products[i] for i in idxs[1:]]
-        names_differ = any(not _names_compatible(leader, m) for m in members)
+        leader_sku = canonical_sku(leader.get("productCode"))
+        names_differ = bool(leader_sku) and any(
+            canonical_sku(m.get("productCode")) == leader_sku and not _names_compatible(leader, m) for m in members
+        )
         before = len(leader["images"])
         _merge_swatch(leader, members)
         added = len(leader["images"]) - before
+        _prefer_series_name(leader, members, series)
         leader["productKey"] = product_key(leader)
         for i, member in zip(idxs[1:], members):
             drop.add(i)

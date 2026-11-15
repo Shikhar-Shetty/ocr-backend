@@ -168,6 +168,56 @@ class GroupingTests(unittest.TestCase):
         self.assertTrue(any("shares this SKU" in w for w in swatch["reviewWarnings"]))
         self.assertFalse(any("name could not" in w for w in swatch["reviewWarnings"]))
 
+    def _series_catalogue(self, *extra):
+        """Balistone layout: 'Balistone X' preview page, then an 'X' swatch page with the specs."""
+        records = []
+        for page, design in ((7, "Royal Blue"), (9, "Ash"), (11, "Fog")):
+            records.append(product(f"Balistone {design}", image=f"room{page}", page=page, size=None))
+            records.append(product(design.upper(), image=f"face{page + 1}", page=page + 1))
+        return ce.dedupe_products(records + list(extra))
+
+    def test_series_title_and_bare_design_name_on_adjacent_pages_merge(self):
+        kept, _ = self._series_catalogue()
+        self.assertEqual(sorted(p["productName"] for p in kept),
+                         ["Balistone Ash", "Balistone Fog", "Balistone Royal Blue"])
+        royal = next(p for p in kept if p["productName"] == "Balistone Royal Blue")
+        self.assertEqual(royal["primaryImageUrl"], "/img/face8.png")  # tile face, not the room shot
+        self.assertEqual([i["id"] for i in royal["images"]], ["face8", "room7"])
+        self.assertEqual(royal["size"], "800x1600 mm")
+        self.assertFalse(any("different names" in w for w in royal["reviewWarnings"]))
+
+    def test_series_link_needs_adjacent_pages(self):
+        kept, _ = ce.dedupe_products([
+            product("Balistone Ash", image="a", page=3, size=None),
+            product("Balistone Fog", image="b", page=4, size=None),
+            product("ASH", image="c", page=20),
+        ])
+        self.assertEqual(len(kept), 3)
+
+    def test_two_differently_prefixed_names_never_link(self):
+        kept, _ = ce.dedupe_products([
+            product("Statuario Ash", image="a", page=3), product("Statuario Fog", image="b", page=5),
+            product("Balistone Ash", image="c", page=4), product("Balistone Fog", image="d", page=6),
+        ])
+        self.assertEqual(len(kept), 4)
+
+    def test_series_link_keeps_size_and_sku_guards(self):
+        kept, _ = ce.dedupe_products([
+            product("Balistone Ash", image="a", page=7, size="600x1200 mm"),
+            product("ASH", image="b", page=8, size="800x2400 mm"),
+            product("Balistone Fog", image="c", page=9, sku="BF-1"),
+            product("FOG", image="d", page=10, sku="BF-2"),
+        ])
+        self.assertEqual(len(kept), 4)
+
+    def test_word_that_is_a_whole_name_is_not_a_series(self):
+        # 'Onyx' is itself a product, so 'Onyx Blue' next to 'Blue' is not 'series + design'.
+        kept, _ = ce.dedupe_products([
+            product("Onyx", image="a", page=1), product("Onyx Blue", image="b", page=2),
+            product("Onyx Grey", image="c", page=4), product("Blue", image="d", page=3),
+        ])
+        self.assertEqual(len(kept), 4)
+
     def test_unrelated_products_are_untouched(self):
         kept, removed = ce.dedupe_products([
             product("Calacatta Gold", image="a"), product("Statuario", image="b"),
