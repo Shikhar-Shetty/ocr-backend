@@ -100,7 +100,30 @@ def _compressed_pdf(directory: Path) -> Path:
     return compressed
 
 
-def _run_extractor(pdf_path: Path, output_dir: Path, job_id: str, start_page: int, end_page: int, pages: str) -> dict:
+def _name_list(raw: str) -> str:
+    """A JSON list of names from the ERP (brands / categories), validated and bounded."""
+    if not raw.strip():
+        return ""
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=422, detail="brands and categories must be JSON lists") from error
+    if not isinstance(values, list):
+        raise HTTPException(status_code=422, detail="brands and categories must be JSON lists")
+    names = [str(v).strip()[:80] for v in values if isinstance(v, str) and v.strip()][:500]
+    return json.dumps(names)
+
+
+def _run_extractor(
+    pdf_path: Path,
+    output_dir: Path,
+    job_id: str,
+    start_page: int,
+    end_page: int,
+    pages: str,
+    brands: str = "",
+    categories: str = "",
+) -> dict:
     command = [
         sys.executable, str(EXTRACTOR), "--pdf", str(pdf_path),
         "--output-dir", str(output_dir), "--job-id", job_id,
@@ -108,6 +131,10 @@ def _run_extractor(pdf_path: Path, output_dir: Path, job_id: str, start_page: in
     ]
     if pages:
         command.extend(["--pages", pages])
+    if brands:
+        command.extend(["--brands-json", brands])
+    if categories:
+        command.extend(["--categories-json", categories])
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=EXTRACTION_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired as error:
@@ -193,14 +220,18 @@ async def extract_catalogue(
     start_page: Annotated[int, Form()] = 1,
     end_page: Annotated[int, Form()] = 0,
     pages: Annotated[str, Form()] = "",
+    brands: Annotated[str, Form(description="JSON list of the ERP's brand names")] = "",
+    categories: Annotated[str, Form(description="JSON list of the ERP's category names")] = "",
 ) -> dict:
     directory = _job_dir(token)
     if start_page < 1 or end_page < 0:
         raise HTTPException(status_code=422, detail="Invalid page range")
+    brand_list, category_list = _name_list(brands), _name_list(categories)
     output_dir = directory / "images"
     output_dir.mkdir(exist_ok=True)
     result = await asyncio.to_thread(
-        _run_extractor, _compressed_pdf(directory), output_dir, job_id, start_page, end_page, pages
+        _run_extractor, _compressed_pdf(directory), output_dir, job_id, start_page, end_page, pages,
+        brand_list, category_list,
     )
     return {"result": result}
 

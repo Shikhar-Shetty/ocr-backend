@@ -712,11 +712,34 @@ def mark_template_lines(lines: List[Dict[str, Any]], profile: DocProfile) -> Non
 # --------------------------------------------------------------------------------------
 
 
+# Separators catalogues put between the parts of a name line: "Name \\ 600x1500 \\ Glossy",
+# "Name | 600x1200 | Matt", "Name • Glossy". A plain "/" inside a word ("Ivory/Beige") is not one.
+NAME_PART_SEPARATOR = re.compile(r"\s*(?:\\+|\||•|·|\s/\s)\s*")
+
+
+def _is_spec_part(part: str) -> bool:
+    """A name part that is only a specification: a size, a finish, a material or a thickness."""
+    low = part.strip().lower()
+    if not low:
+        return True
+    if low in KNOWN_SURFACES_LOWER or low in KNOWN_MATERIALS_LOWER:
+        return True
+    words = [w for w in re.split(r"\s+", low) if w]
+    return all(w in KNOWN_SURFACES_LOWER or w in KNOWN_MATERIALS_LOWER or is_dimension_token(w)
+               or UNIT_TOKEN_REGEX.match(w) for w in words)
+
+
 def clean_name_text(text: str) -> str:
     value = SIZE_REGEX.sub(" ", text)
     value = DIM_FRAGMENT_REGEX.sub(" ", value)
     value = PRICE_REGEX.sub(" ", value)
-    return re.sub(r"\s+", " ", value).strip(" -–|:,/")
+    # "Name \\ 600x1500 \\ Glossy": keep the parts that are the name, not its specifications
+    # (the size and finish are still read into Size and Surface / Finish).
+    parts = [p.strip() for p in NAME_PART_SEPARATOR.split(value)]
+    if len(parts) > 1:
+        kept = [p for p in parts if not _is_spec_part(p)]
+        value = " ".join(kept) if kept else value
+    return re.sub(r"\s+", " ", value).strip(" -–|:,/\\")
 
 
 def is_name_eligible(text: str) -> bool:
@@ -1468,6 +1491,160 @@ def detect_brand(text: str, fallback_brand: Optional[str] = None) -> Optional[st
 
 
 # --------------------------------------------------------------------------------------
+# Document context: which brand and category a catalogue is for
+# --------------------------------------------------------------------------------------
+# The ERP sends its own brand and category names with each extraction, so the result uses the
+# names it already has. Several brand names are ordinary words ("Gold", "Rock", "Metro"), so a
+# name only counts where a catalogue announces itself: the file name, the PDF title, or the start
+# of a large / bold line on its first pages - never a word inside a product's name or text.
+
+DOCUMENT_CONTEXT_PAGES = 3
+
+# Words that describe a category without identifying it ("Floor Tiles" is identified by "floor").
+_CATEGORY_FILLER = {"and", "the", "for", "with", "products", "product", "items", "range", "collection"}
+# Other words a catalogue uses for the same kind of goods, by the stem of a category's word.
+_CATEGORY_SYNONYMS = {
+    "sanit": ["wc", "water closet", "wash basin", "closet", "commode"],
+    "fauce": ["tap", "mixer", "bath fitting"],
+    "showe": ["rain shower", "hand shower"],
+    "sink": ["kitchen sink"],
+    "heate": ["geyser"],
+}
+
+
+def _name_regex(name: str) -> "re.Pattern[str]":
+    """A brand name however a file name or heading writes it: "DC & Nano", "DC_Nano", "dc-nano"."""
+    words = [re.escape(w) for w in re.findall(r"[A-Za-z0-9]+", name)] or [re.escape(name)]
+    return re.compile(r"(?<![A-Za-z0-9])" + r"[\s_.&+\-]*".join(words) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def brand_names(provided: Optional[List[str]]) -> List[str]:
+    """The ERP's brands first (their spelling wins), then the built-in list; longest first."""
+    seen: Dict[str, str] = {}
+    for name in list(provided or []) + KNOWN_BRANDS:
+        clean = re.sub(r"\s+", " ", str(name)).strip()
+        if clean and clean.lower() not in seen:
+            seen[clean.lower()] = clean
+    return sorted(seen.values(), key=len, reverse=True)
+
+
+def _is_prominent(line: Dict[str, Any], body: float) -> bool:
+    size = line.get("size", 0.0) or 0.0
+    return bool(body and size >= body * 1.25) or (bool(line.get("bold")) and len(line["text"].split()) <= 6)
+
+
+def brand_starting(text: str, brands: List[str]) -> Optional[str]:
+    """The brand a heading starts with ("JAQUAR", "Jaquar Bath Collection"); a product code
+    that starts with a brand ("SOMANY-901") is not a heading."""
+    if CODE_REGEX.fullmatch(text.strip().upper()) or re.search(r"[A-Za-z]+[-_/]?\d{2,}", text.split()[0] if text.split() else ""):
+        return None
+    for brand in brands:
+        match = _name_regex(brand).match(text.strip())
+        if match and len(text.split()) <= 8:
+            return brand
+    return None
+
+
+def brand_line(text: str, brands: List[str]) -> Optional[str]:
+    """A line that is nothing but a brand name (a logo / page header on a product page)."""
+    key = normalize_text_key(text)
+    for brand in brands:
+        if key == normalize_text_key(brand):
+            return brand
+    return None
+
+
+def _category_terms(category: str) -> List[List[str]]:
+    """Ways a catalogue may name this category: its significant word stems, then synonyms."""
+    words = [w for w in re.findall(r"[a-z]+", category.lower()) if len(w) >= 3]
+    significant = [w for w in words if w not in _CATEGORY_FILLER] or words
+    stems = [w[:5] for w in significant]
+    terms = [stems] if stems else []
+    for stem in stems:
+        for synonym in _CATEGORY_SYNONYMS.get(stem, []):
+            terms.append([synonym])
+    return terms
+
+
+def category_in(text: str, category: str) -> bool:
+    low = text.lower()
+    for term in _category_terms(category):
+        if all(re.search(r"(?<![a-z])" + re.escape(t), low) for t in term):
+            return True
+    return False
+
+
+def is_tile_category(category: Optional[str]) -> bool:
+    return bool(category and "tile" in category.lower())
+
+
+def detect_document_context(
+    doc: "fitz.Document", pdf_name: str, brands: Optional[List[str]], categories: Optional[List[str]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """(brand, category) the catalogue is for, from its file name, title and first pages."""
+    names = brand_names(brands)
+    meta = doc.metadata or {}
+    labels = " ".join(str(meta.get(k) or "") for k in ("title", "subject", "keywords"))
+    first: List[Tuple[Dict[str, Any], float]] = []
+    for p_idx in range(min(DOCUMENT_CONTEXT_PAGES, len(doc))):
+        lines = extract_native_lines(doc[p_idx])
+        body = char_weighted_mode(lines) or 10.0
+        first.extend((ln, body) for ln in lines)
+
+    brand_score: Counter = Counter()
+    for brand in names:
+        pattern = _name_regex(brand)
+        if pattern.search(pdf_name) or pattern.search(labels):
+            brand_score[brand] += 3
+    for ln, body in first:
+        if _is_prominent(ln, body):
+            found = brand_starting(ln["text"], names)
+            if found:
+                brand_score[found] += 2
+    ranked_brands = brand_score.most_common(2)
+    brand = None
+    if ranked_brands and ranked_brands[0][1] >= 2:
+        # Two brands announced equally (a multi-brand catalogue): no single catalogue brand - each
+        # page's own heading decides (see page_brand_for).
+        tied = len(ranked_brands) > 1 and ranked_brands[1][1] == ranked_brands[0][1]
+        brand = None if tied else ranked_brands[0][0]
+
+    category = None
+    if categories:
+        cat_score: Counter = Counter()
+        early_text = "\n".join(ln["text"] for ln, _ in first)
+        for cat in categories:
+            if category_in(pdf_name.replace("_", " ").replace("-", " "), cat) or category_in(labels, cat):
+                cat_score[cat] += 3
+            cat_score[cat] += 2 * min(3, sum(1 for ln, body in first
+                                             if _is_prominent(ln, body) and category_in(ln["text"], cat)))
+            if category_in(early_text, cat):
+                cat_score[cat] += 1
+        ranked = sorted(cat_score.items(), key=lambda kv: (-kv[1], -len(kv[0].split())))
+        if ranked and ranked[0][1] >= 2:
+            category = ranked[0][0]
+    return brand, category
+
+
+def resolve_category(tile_guess: str, document_category: Optional[str], categories: Optional[List[str]]) -> Optional[str]:
+    """A product's category: the catalogue's own, unless it is a tile catalogue (then the per-tile
+    guess - floor, wall, outdoor - when the ERP has that category)."""
+    if document_category and not is_tile_category(document_category):
+        return document_category
+    if categories:
+        for cat in categories:
+            if cat.lower() == tile_guess.lower():
+                return cat
+        if document_category:
+            return document_category
+        # A tile kind the ERP does not have (slab, outdoor): its floor tiles, else any tile category.
+        tile_cats = [c for c in categories if is_tile_category(c)]
+        floor = [c for c in tile_cats if "floor" in c.lower()]
+        return (floor or tile_cats or [None])[0]
+    return tile_guess
+
+
+# --------------------------------------------------------------------------------------
 # Layout: grouping lines, assigning text blocks to images
 # --------------------------------------------------------------------------------------
 
@@ -1925,12 +2102,35 @@ def stacked_label_value(lines: List[Dict[str, Any]], label: str) -> Optional[str
     return None
 
 
-def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfile, doc_brand: Optional[str]) -> Dict[str, Any]:
+def page_brand_for(state: Dict[str, Any], doc_brand: Optional[str], doc_ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    """A page's brand: a logo / header line that is just a brand name, else the catalogue's brand,
+    else a built-in brand named in the page text."""
+    brands = (doc_ctx or {}).get("brands") or brand_names(None)
+    lines = state.get("lines", [])
+    for line in lines:
+        found = brand_line(line["text"], brands)
+        if found:
+            return found
+    # The page's own title - its largest heading - when it starts with a brand
+    # ("Kajaria Eternity Premium Collection").
+    body = state.get("bodySize") or char_weighted_mode(lines) or 10.0
+    largest = max((l.get("size", 0.0) or 0.0 for l in lines), default=0.0)
+    for line in lines:
+        size = line.get("size", 0.0) or 0.0
+        if size >= body * 1.25 and size >= largest * 0.95:
+            found = brand_starting(line["text"], brands)
+            if found:
+                return found
+    return doc_brand or detect_brand(state["totalText"])
+
+
+def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfile, doc_brand: Optional[str],
+                  doc_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     page_no = state["pageNo"]
     lines = card["lines"]
     card_text = "\n".join(l["text"] for l in sorted(lines, key=line_sort_key))
     total_text = state["totalText"]
-    page_brand = detect_brand(total_text, doc_brand)
+    page_brand = page_brand_for(state, doc_brand, doc_ctx)
     best_img = card.get("image")
     img_conf = card.get("imageConf", 0.0)
 
@@ -1991,6 +2191,11 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
         category, subcategory = "Outdoor Tiles", "Heavy Duty"
     elif "slab" in scope_low or (specs.get("size") and "1600" in specs["size"]):
         category, subcategory = "Slab Tiles", "Large Format"
+    # The catalogue's own category (sanitaryware, faucets...) wins over the per-tile guess, and
+    # only categories the ERP has are returned when it sent its list.
+    category = resolve_category(category, (doc_ctx or {}).get("category"), (doc_ctx or {}).get("categories"))
+    if not is_tile_category(category):
+        subcategory = None
 
     # Calibrated confidence: weakest of the components that exist
     parts = [name_conf, img_conf if best_img else 0.3]
@@ -2093,10 +2298,11 @@ def build_product(card: Dict[str, Any], state: Dict[str, Any], profile: DocProfi
     }
 
 
-def finalize_page(state: Dict[str, Any], profile: DocProfile, doc_brand: Optional[str]) -> Dict[str, Any]:
+def finalize_page(state: Dict[str, Any], profile: DocProfile, doc_brand: Optional[str],
+                  doc_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     products = []
     if not state.get("nonProduct"):
-        products = [build_product(card, state, profile, doc_brand) for card in state["cards"]]
+        products = [build_product(card, state, profile, doc_brand, doc_ctx) for card in state["cards"]]
     orphan_ids = set(state.get("orphanImageIds", []))
     orphans = [
         {k: img[k] for k in ("id", "filename", "url", "sourcePage", "bbox", "pixelWidth", "pixelHeight", "method", "sha256")}
@@ -2108,7 +2314,7 @@ def finalize_page(state: Dict[str, Any], profile: DocProfile, doc_brand: Optiona
         "ocrUsed": state.get("ocrUsed", False),
         "layout": state.get("layout"),
         "previewUrl": state["previewUrl"],
-        "brand": detect_brand(state["totalText"], doc_brand),
+        "brand": page_brand_for(state, doc_brand, doc_ctx),
         "products": products,
         "orphanImages": orphans,
         "extractedImagesCount": len(state["images"]),
@@ -2537,6 +2743,10 @@ def main():
                              "extras go to extraction_extras.json)")
     parser.add_argument("--profile-sample", type=int, default=150,
                         help="Max pages sampled for the document profile pass")
+    parser.add_argument("--brands-json", default="",
+                        help="JSON list of the ERP's brand names, matched against the catalogue")
+    parser.add_argument("--categories-json", default="",
+                        help="JSON list of the ERP's category names, matched against the catalogue")
     args = parser.parse_args()
 
     pdf_path = os.path.abspath(args.pdf)
@@ -2566,14 +2776,32 @@ def main():
     else:
         selected_pages = list(range(start_p, end_p + 1))
 
-    doc_brand = detect_brand(os.path.basename(pdf_path))
-    if not doc_brand and doc.metadata:
-        doc_brand = detect_brand(str(doc.metadata))
-    if not doc_brand:
-        for p_idx in range(min(5, total_pages)):
-            doc_brand = detect_brand(doc[p_idx].get_text())
-            if doc_brand:
-                break
+    def json_list(raw: str) -> List[str]:
+        try:
+            values = json.loads(raw) if raw.strip() else []
+        except json.JSONDecodeError:
+            return []
+        return [str(v).strip() for v in values if str(v).strip()] if isinstance(values, list) else []
+
+    erp_brands = json_list(args.brands_json)
+    erp_categories = json_list(args.categories_json)
+    try:
+        doc_brand, doc_category = detect_document_context(
+            doc, os.path.basename(pdf_path), erp_brands, erp_categories)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        doc_brand, doc_category = None, None
+    if not doc_brand and not erp_brands:
+        # No brand list from the ERP: the built-in brands anywhere on the first pages.
+        doc_brand = detect_brand(os.path.basename(pdf_path))
+        if not doc_brand and doc.metadata:
+            doc_brand = detect_brand(str(doc.metadata))
+        if not doc_brand:
+            for p_idx in range(min(5, total_pages)):
+                doc_brand = detect_brand(doc[p_idx].get_text())
+                if doc_brand:
+                    break
+    doc_ctx = {"brands": brand_names(erp_brands), "categories": erp_categories, "category": doc_category}
 
     # Pass 1: document profile (template text, decorative images, body font)
     try:
@@ -2606,7 +2834,7 @@ def main():
             pages_result.append({"pageNo": p, "error": errors[p], "productCount": 0, "imageCount": 0})
             continue
         try:
-            page_data = finalize_page(states[p], profile, doc_brand)
+            page_data = finalize_page(states[p], profile, doc_brand, doc_ctx)
             pages_result.append({
                 "pageNo": page_data["pageNo"],
                 "isScanned": page_data["isScanned"],
@@ -2663,7 +2891,8 @@ def main():
         output_payload = {
             "jobId": args.job_id, "totalPages": total_pages,
             "processedStartPage": start_p, "processedEndPage": end_p,
-            "documentBrand": doc_brand, "totalProducts": len(all_products),
+            "documentBrand": doc_brand, "documentCategory": doc_category,
+            "totalProducts": len(all_products),
             "pages": pages_result, "products": all_products, **extras,
         }
     else:
@@ -2673,6 +2902,7 @@ def main():
             "processedStartPage": start_p,
             "processedEndPage": end_p,
             "documentBrand": doc_brand,
+            "documentCategory": doc_category,
             "totalProducts": len(all_products),
             "pages": [to_v1_page(pg) for pg in pages_result],
             "products": [to_v1_product(prod) for prod in all_products],
